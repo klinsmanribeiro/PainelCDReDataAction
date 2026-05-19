@@ -2948,6 +2948,13 @@
         const res = await fetch('/api/cdr?' + p);
         const data = await res.json();
 
+        // Sessão expirada: redireciona para login
+        if (res.status === 401 || data.auth_required) {
+          document.getElementById('tbody').innerHTML =
+            '<tr><td colspan="14"><div class="state">Sessão expirada. <a href="/login">Clique aqui para fazer login novamente.</a></div></td></tr>';
+          btn.disabled = false; return;
+        }
+
         if (data.rate_limit_hits !== undefined) checkRLAlert(data.rate_limit_hits);
         if (data.requests_last_minute !== undefined) updateRate(data.requests_last_minute, 10);
 

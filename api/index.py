@@ -9,7 +9,9 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-app = Flask(__name__)
+# Em Vercel, api/index.py fica em /var/task/api/; templates estão em /var/task/templates/
+_ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+app = Flask(__name__, template_folder=os.path.join(_ROOT_DIR, "templates"))
 app.secret_key = os.getenv("SECRET_KEY", "hsm-dashboard-super-secret-key")
 
 # ─── AUTENTICAÇÃO ────────────────────────────────────────────────────────────
@@ -18,9 +20,11 @@ LOGIN_PASSWORD = os.getenv("LOGIN_PASSWORD", "")
 
 @app.before_request
 def check_login():
-    # Rotas que não precisam de login
-    public_routes = ["login", "static", "debug_auth", "login_genesys", "callback"]
+    public_routes = ["login", "static", "debug_auth", "debug_connection", "login_genesys", "callback"]
     if request.endpoint not in public_routes and not session.get("logged_in"):
+        # Rotas de API retornam JSON em vez de redirecionar (evita HTML em fetch())
+        if request.path.startswith("/api/"):
+            return jsonify({"error": "Sessão expirada. Faça login novamente.", "auth_required": True}), 401
         return redirect(url_for("login"))
 
 @app.route("/login", methods=["GET", "POST"])
@@ -95,18 +99,77 @@ def callback():
 @app.route("/debug-auth")
 def debug_auth():
     """Rota para validar configurações de autenticação em produção."""
-    # Mascara o Client ID para segurança (mostra apenas os primeiros 5 caracteres)
     masked_client_id = f"{GENESYS_CLIENT_ID[:5]}..." if GENESYS_CLIENT_ID else "Não configurado"
-    
+
     return jsonify({
         "status": "online",
         "region": GENESYS_REGION,
         "redirect_uri": REDIRECT_URI,
         "client_id": masked_client_id,
         "has_client_secret": bool(GENESYS_CLIENT_SECRET),
+        "has_oauth_token": bool(os.getenv("OAUTH_TOKEN")),
+        "has_login_user": bool(os.getenv("LOGIN_USER")),
         "has_refresh_token_disk": os.path.exists(REFRESH_TOKEN_FILE),
-        "vercel_env": bool(os.environ.get("VERCEL"))
+        "vercel_env": bool(os.environ.get("VERCEL")),
+        "template_folder": app.template_folder,
     })
+
+
+@app.route("/debug-connection")
+def debug_connection():
+    """Testa a conectividade com a API Genesys e retorna diagnóstico detalhado."""
+    result = {
+        "region": GENESYS_REGION,
+        "base_url": BASE_URL,
+        "has_client_id": bool(GENESYS_CLIENT_ID),
+        "has_client_secret": bool(GENESYS_CLIENT_SECRET),
+        "has_oauth_token": bool(os.getenv("OAUTH_TOKEN")),
+        "vercel_env": bool(os.environ.get("VERCEL")),
+        "token_status": None,
+        "api_test": None,
+        "error": None,
+    }
+
+    # Tenta obter token
+    try:
+        token = get_auth_token()
+        if token:
+            result["token_status"] = "ok" if not token.startswith("Bearer ") or len(token) > 10 else "vazio"
+        else:
+            result["token_status"] = "falhou - nenhum token obtido"
+            result["error"] = "get_auth_token() retornou None. Verifique GENESYS_CLIENT_ID, GENESYS_CLIENT_SECRET ou OAUTH_TOKEN nas variáveis de ambiente do Vercel."
+            return jsonify(result)
+    except Exception as e:
+        result["token_status"] = f"exceção: {str(e)}"
+        result["error"] = str(e)
+        return jsonify(result)
+
+    # Testa um endpoint leve da Genesys
+    try:
+        test_resp = requests.get(
+            f"{BASE_URL}/api/v2/users/me",
+            headers=HEADERS,
+            timeout=10,
+        )
+        result["api_test"] = {
+            "status_code": test_resp.status_code,
+            "ok": test_resp.status_code == 200,
+        }
+        if test_resp.status_code == 200:
+            me = test_resp.json()
+            result["api_test"]["user"] = me.get("name", "—")
+            result["api_test"]["org"] = me.get("organization", {}).get("name", "—")
+        elif test_resp.status_code == 401:
+            result["error"] = "Token inválido ou expirado (401). Atualize OAUTH_TOKEN ou verifique as credenciais Client Credentials no Vercel."
+        elif test_resp.status_code == 403:
+            result["error"] = "Sem permissão (403). O OAuth client não tem os escopos necessários (analytics:conversationDetail:view)."
+        else:
+            result["error"] = f"Genesys retornou HTTP {test_resp.status_code}."
+    except Exception as e:
+        result["api_test"] = {"ok": False, "error": str(e)}
+        result["error"] = f"Falha ao conectar na API Genesys: {str(e)}"
+
+    return jsonify(result)
 
 # ─── CONFIGURAÇÃO GENESYS & CDR ──────────────────────────────────────────────
 GENESYS_REGION   = os.getenv("GENESYS_REGION", "sae1.pure.cloud")
@@ -959,7 +1022,7 @@ def api_cdr():
     # Monta intervalo ISO 8601
     interval = f"{start_date}T00:00:00.000Z/{end_date}T23:59:59.999Z"
 
-    body = {
+    base_body = {
         "interval": interval,
         "order":    "asc",
         "orderBy":  "conversationStart",
@@ -972,52 +1035,70 @@ def api_cdr():
 
     # Filtro por flowId
     if flow_id:
-        body["segmentFilters"].append({
+        base_body["segmentFilters"].append({
             "type": "and",
             "predicates": [{"dimension": "flowId", "value": flow_id}]
         })
 
     # Filtro por direção
     if direction_f:
-        body["conversationFilters"].append({
+        base_body["conversationFilters"].append({
             "type": "and",
             "predicates": [{"dimension": "originatingDirection", "value": direction_f}]
         })
 
-    get_auth_token() # Garante token válido
+    get_auth_token()  # Garante token válido
+
+    # Pagina pela API da Genesys (máx 1000 registros = 10 páginas × 100)
+    convs = []
+    genesys_page = 1
+    MAX_GENESYS_PAGES = 10
     try:
-        resp = requests.post(
-            f"{BASE_URL}/api/v2/analytics/conversations/details/query",
-            headers=HEADERS,
-            json=body,
-            timeout=20,
-        )
+        while genesys_page <= MAX_GENESYS_PAGES:
+            body = dict(base_body)
+            body["paging"] = {"pageSize": 100, "pageNumber": genesys_page}
+            resp = requests.post(
+                f"{BASE_URL}/api/v2/analytics/conversations/details/query",
+                headers=HEADERS,
+                json=body,
+                timeout=20,
+            )
 
-        if resp.status_code == 429:
-            rate_hits += 1
-            return jsonify({
-                "error": "Rate limit da Genesys (429). Aguarde antes de tentar novamente.",
-                "rate_limit_hit": True, "rate_limit_hits": rate_hits,
-                "alert": rate_hits % 10 == 0,
-                "records": [], "stats": {}, "pagination": {}
-            }), 200
+            if resp.status_code == 429:
+                rate_hits += 1
+                return jsonify({
+                    "error": "Rate limit da Genesys (429). Aguarde antes de tentar novamente.",
+                    "rate_limit_hit": True, "rate_limit_hits": rate_hits,
+                    "alert": rate_hits % 10 == 0,
+                    "records": [], "stats": {}, "pagination": {}
+                }), 200
 
-        if resp.status_code != 200:
-            return jsonify({
-                "error": genesys_error(resp),
-                "records": [], "stats": {}, "pagination": {}
-            }), 200
+            if resp.status_code != 200:
+                if not convs:  # Falhou já na 1ª página: retorna erro
+                    return jsonify({
+                        "error": genesys_error(resp),
+                        "records": [], "stats": {}, "pagination": {}
+                    }), 200
+                break  # Falha em página intermediária: usa o que já buscou
 
-        data = resp.json()
+            data = resp.json()
+            page_convs = data.get("conversations", [])
+            convs.extend(page_convs)
+
+            total_hits = data.get("totalHits", 0)
+            if not page_convs or len(convs) >= total_hits:
+                break
+            genesys_page += 1
 
     except requests.exceptions.Timeout:
-        return jsonify({"error": "Timeout: Genesys não respondeu em 20s.", "records": [], "stats": {}, "pagination": {}}), 200
+        if not convs:
+            return jsonify({"error": "Timeout: Genesys não respondeu em 20s.", "records": [], "stats": {}, "pagination": {}}), 200
     except requests.exceptions.ConnectionError:
-        return jsonify({"error": "Falha de conexão. Verifique sua internet.", "records": [], "stats": {}, "pagination": {}}), 200
+        if not convs:
+            return jsonify({"error": "Falha de conexão. Verifique sua internet.", "records": [], "stats": {}, "pagination": {}}), 200
     except Exception as e:
-        return jsonify({"error": f"Erro inesperado: {str(e)}", "records": [], "stats": {}, "pagination": {}}), 200
-
-    convs = data.get("conversations", [])
+        if not convs:
+            return jsonify({"error": f"Erro inesperado: {str(e)}", "records": [], "stats": {}, "pagination": {}}), 200
 
     # Processar
     all_records = [process_conversation(c, flow_id) for c in convs]
