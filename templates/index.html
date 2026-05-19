@@ -2672,6 +2672,14 @@
           </svg>
           Escanear
         </button>
+        <button class="btn btn-export" id="btn-export-tasks" onclick="exportTasksCSV()" disabled title="Escanear primeiro">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+            <polyline points="7 10 12 15 17 10"/>
+            <line x1="12" y1="15" x2="12" y2="3"/>
+          </svg>
+          Exportar CSV
+        </button>
       </div>
     </div>
 
@@ -3165,12 +3173,15 @@
     }
 
     // ── Scan Call Tasks CDR ───────────────────────────────────────────────────
+    let _lastScannedFlows = [];  // guarda resultado para exportação
+
     async function scanCdrTasks() {
       const btn = document.getElementById('btn-scan');
       const tree = document.getElementById('tasks-tree');
       const info = document.getElementById('tasks-info');
       const cacheEl = document.getElementById('tasks-cache-info');
       const flowId = document.getElementById('taskFlowSelect').value;
+      document.getElementById('btn-export-tasks').disabled = true;
 
       btn.disabled = true;
       tree.innerHTML = '<div class="state"><div class="spinner"></div>Escaneando... Aguarde.</div>';
@@ -3276,12 +3287,57 @@
         // Auto-expand if single flow
         if (flows.length === 1) toggleFlow('flow0');
 
+        // Guarda dados e habilita exportação
+        _lastScannedFlows = flows;
+        document.getElementById('btn-export-tasks').disabled = false;
+
         showToast(`${flows.length} fluxo(s) · ${totalCalls} Call Tasks CDR`);
 
       } catch (e) {
         tree.innerHTML = `<div class="state">✕ Erro: ${e.message}</div>`;
       }
       btn.disabled = false;
+    }
+
+    function exportTasksCSV() {
+      if (!_lastScannedFlows.length) return;
+
+      const rows = [['Fluxo', 'Tipo de Fluxo', 'Pasta (Tarefa)', 'Nome CDR', 'Tracking ID', 'Action ID']];
+
+      _lastScannedFlows.forEach(f => {
+        f.cdr_calls.forEach(c => {
+          rows.push([
+            f.flow_name,
+            f.flow_type,
+            c.parent_task || '—',
+            c.label       || '—',
+            c.tracking_id || '—',
+            c.action_id   || '—',
+          ]);
+        });
+      });
+
+      const csv = rows.map(r =>
+        r.map(v => '"' + String(v).replace(/"/g, '""') + '"').join(';')
+      ).join('\r\n');
+
+      const bom  = '﻿';
+      const blob = new Blob([bom + csv], { type: 'text/csv;charset=utf-8;' });
+      const url  = URL.createObjectURL(blob);
+      const a    = document.createElement('a');
+
+      const flowName = _lastScannedFlows.length === 1
+        ? _lastScannedFlows[0].flow_name.replace(/[^a-z0-9]/gi, '_')
+        : 'Todos_os_Fluxos';
+      const date = new Date().toISOString().slice(0, 10);
+
+      a.href     = url;
+      a.download = `CallTaskCDR_${flowName}_${date}.csv`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+      showToast('CSV exportado com sucesso!');
     }
 
     function toggleFlow(id) {
