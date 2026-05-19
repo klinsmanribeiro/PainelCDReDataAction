@@ -1144,6 +1144,21 @@
       box-shadow: 0 0 12px rgba(79, 142, 247, 0.3);
     }
 
+    .btn-export {
+      background: #1a7a4a;
+      color: #fff;
+    }
+
+    .btn-export:hover {
+      opacity: 0.85;
+      box-shadow: 0 0 12px rgba(26, 122, 74, 0.35);
+    }
+
+    .btn-export.loading {
+      opacity: 0.6;
+      cursor: wait;
+    }
+
     .btn-primary:disabled {
       opacity: 0.4;
       cursor: not-allowed;
@@ -2561,6 +2576,14 @@
         </svg>
         Buscar
       </button>
+      <button class="btn btn-export" id="btn-export" onclick="exportCSV()">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+          <polyline points="7 10 12 15 17 10"/>
+          <line x1="12" y1="15" x2="12" y2="3"/>
+        </svg>
+        Exportar CSV
+      </button>
     </div>
 
     <!-- STATS -->
@@ -3024,6 +3047,54 @@
           `<tr><td colspan="14"><div class="state">✕ ${e.message}</div></td></tr>`;
       }
       btn.disabled = false;
+    }
+
+    async function exportCSV() {
+      const btn = document.getElementById('btn-export');
+      const start = document.getElementById('startDate').value;
+      const end   = document.getElementById('endDate').value;
+      const flowId    = document.getElementById('flowSelect').value;
+      const direction = document.getElementById('dirSelect').value;
+      const flowName  = flowId
+        ? (document.getElementById('flowSelect').selectedOptions[0]?.text || flowId)
+        : 'todos';
+
+      btn.disabled = true;
+      btn.classList.add('loading');
+      btn.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" style="animation:spin 1s linear infinite"><line x1="12" y1="2" x2="12" y2="6"/><line x1="12" y1="18" x2="12" y2="22"/><line x1="4.93" y1="4.93" x2="7.76" y2="7.76"/><line x1="16.24" y1="16.24" x2="19.07" y2="19.07"/><line x1="2" y1="12" x2="6" y2="12"/><line x1="18" y1="12" x2="22" y2="12"/><line x1="4.93" y1="19.07" x2="7.76" y2="16.24"/><line x1="16.24" y1="7.76" x2="19.07" y2="4.93"/></svg> Exportando...`;
+
+      try {
+        const p = new URLSearchParams({ startDate: start, endDate: end });
+        if (flowId)    p.append('flowId', flowId);
+        if (direction) p.append('direction', direction);
+
+        const res = await fetch('/api/cdr/export?' + p);
+
+        if (res.status === 401) {
+          showError('Sessão expirada. Faça login novamente.');
+        } else if (!res.ok) {
+          const d = await res.json().catch(() => ({}));
+          showError(d.error || `Erro ${res.status} ao exportar.`);
+        } else {
+          const blob = await res.blob();
+          const url  = URL.createObjectURL(blob);
+          const a    = document.createElement('a');
+          const date = start === end ? start : `${start}_${end}`;
+          a.href     = url;
+          a.download = `CDR_${flowName.replace(/[^a-z0-9]/gi,'_')}_${date}.csv`;
+          document.body.appendChild(a);
+          a.click();
+          document.body.removeChild(a);
+          URL.revokeObjectURL(url);
+          showToast('CSV exportado com sucesso!');
+        }
+      } catch (e) {
+        showError('Erro ao exportar: ' + e.message);
+      }
+
+      btn.disabled = false;
+      btn.classList.remove('loading');
+      btn.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg> Exportar CSV`;
     }
 
     function renderPagination(page, total) {

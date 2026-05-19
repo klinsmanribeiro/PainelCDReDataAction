@@ -1207,6 +1207,106 @@ def api_cdr():
     })
 
 
+@app.route("/api/cdr/export")
+def api_cdr_export():
+    """Exporta todos os CDRs filtrados como arquivo CSV."""
+    import csv, io
+
+    start_date  = request.args.get("startDate", datetime.now().strftime("%Y-%m-%d"))
+    end_date    = request.args.get("endDate",   datetime.now().strftime("%Y-%m-%d"))
+    flow_id     = request.args.get("flowId",    "")
+    direction_f = request.args.get("direction", "")
+
+    interval = f"{start_date}T00:00:00.000Z/{end_date}T23:59:59.999Z"
+
+    base_body = {
+        "interval": interval,
+        "order":    "asc",
+        "orderBy":  "conversationStart",
+        "paging":   {"pageSize": 100, "pageNumber": 1},
+        "segmentFilters":      [],
+        "conversationFilters": [],
+        "evaluationFilters":   [],
+        "surveyFilters":       [],
+    }
+    if flow_id:
+        base_body["segmentFilters"].append({
+            "type": "and",
+            "predicates": [{"dimension": "flowId", "value": flow_id}]
+        })
+    if direction_f:
+        base_body["conversationFilters"].append({
+            "type": "and",
+            "predicates": [{"dimension": "originatingDirection", "value": direction_f}]
+        })
+
+    get_auth_token()
+
+    convs = []
+    genesys_page = 1
+    MAX_EXPORT_PAGES = 50  # até 5000 registros
+    try:
+        while genesys_page <= MAX_EXPORT_PAGES:
+            body = dict(base_body)
+            body["paging"] = {"pageSize": 100, "pageNumber": genesys_page}
+            resp = requests.post(
+                f"{BASE_URL}/api/v2/analytics/conversations/details/query",
+                headers=HEADERS, json=body, timeout=25,
+            )
+            if resp.status_code != 200:
+                if not convs:
+                    return jsonify({"error": genesys_error(resp)}), 200
+                break
+            data = resp.json()
+            page_convs = data.get("conversations", [])
+            convs.extend(page_convs)
+            total_hits = data.get("totalHits", 0)
+            if not page_convs or len(convs) >= total_hits:
+                break
+            genesys_page += 1
+    except Exception as e:
+        if not convs:
+            return jsonify({"error": f"Erro ao buscar dados: {str(e)}"}), 200
+
+    records = [process_conversation(c, flow_id) for c in convs]
+
+    # Gera CSV em memória
+    output = io.StringIO()
+    writer = csv.writer(output, delimiter=";", quoting=csv.QUOTE_ALL)
+    writer.writerow([
+        "ID Conversa", "Início", "Fim", "Duração",
+        "Direção", "ANI (Origem)", "DNIS (Destino)",
+        "Fluxo", "Tipo Fluxo", "Fila", "Agente",
+        "Tempo Atendimento", "Tempo Espera", "Desconexão"
+    ])
+    for r in records:
+        writer.writerow([
+            r.get("conversation_id", ""),
+            r.get("start", ""),
+            r.get("end", ""),
+            r.get("duration", ""),
+            r.get("direction", ""),
+            r.get("ani", ""),
+            r.get("dnis", ""),
+            r.get("flow_name", ""),
+            r.get("flow_type", ""),
+            r.get("queue", ""),
+            r.get("agent", ""),
+            r.get("talk_time", ""),
+            r.get("hold_time", ""),
+            r.get("disconnect_type", ""),
+        ])
+
+    csv_bytes = output.getvalue().encode("utf-8-sig")  # BOM para Excel abrir corretamente
+    filename  = f"CDR_{start_date}_{end_date}.csv"
+
+    return Response(
+        csv_bytes,
+        mimetype="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'}
+    )
+
+
 @app.route("/api/rate-status")
 def rate_status():
     now = time.time()
