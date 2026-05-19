@@ -18,9 +18,10 @@ LOGIN_PASSWORD = os.getenv("LOGIN_PASSWORD", "")
 
 @app.before_request
 def check_login():
-    # Rotas que não precisam de login
-    public_routes = ["login", "static", "debug_auth", "login_genesys", "callback"]
+    public_routes = ["login", "static", "debug_auth", "debug_connection", "login_genesys", "callback"]
     if request.endpoint not in public_routes and not session.get("logged_in"):
+        if request.path.startswith("/api/"):
+            return jsonify({"error": "Sessão expirada. Faça login novamente.", "auth_required": True}), 401
         return redirect(url_for("login"))
 
 @app.route("/login", methods=["GET", "POST"])
@@ -59,53 +60,62 @@ def callback():
     code = request.args.get("code")
     if not code:
         return "Código não fornecido", 400
-    
-    auth_url = f"https://login.{GENESYS_REGION}/oauth/token"
+
     import base64
+    auth_url = f"https://login.{GENESYS_REGION}/oauth/token"
     auth_header = base64.b64encode(f"{GENESYS_CLIENT_ID}:{GENESYS_CLIENT_SECRET}".encode()).decode()
-    
+
     try:
         resp = requests.post(
             auth_url,
-            data={
-                "grant_type": "authorization_code",
-                "code": code,
-                "redirect_uri": REDIRECT_URI
-            },
+            data={"grant_type": "authorization_code", "code": code, "redirect_uri": REDIRECT_URI},
             headers={"Authorization": f"Basic {auth_header}"},
             timeout=15
         )
         resp.raise_for_status()
         data = resp.json()
-        
-        access_token = data.get("access_token")
-        refresh_token = data.get("refresh_token")
-        
+
+        access_token  = data.get("access_token", "")
+        refresh_token = data.get("refresh_token", "")
+        expires_in    = data.get("expires_in", 86400)
+
+        global _token_cache, HEADERS
+        _token_cache = {"token": f"Bearer {access_token}", "expires_at": time.time() + expires_in}
+        HEADERS["Authorization"] = f"Bearer {access_token}"
+
         if refresh_token:
             save_refresh_token(refresh_token)
-        
-        # Atualiza o cache global
-        global HEADERS
-        HEADERS["Authorization"] = f"Bearer {access_token}"
-        
+            return f"""<!DOCTYPE html><html><head><meta charset="utf-8">
+<title>Login Genesys OK</title>
+<style>body{{font-family:sans-serif;max-width:700px;margin:40px auto;padding:20px}}
+pre{{background:#f4f4f4;padding:16px;border-radius:6px;word-break:break-all;white-space:pre-wrap}}
+.btn{{display:inline-block;margin-top:16px;padding:10px 20px;background:#0070f3;color:#fff;border-radius:6px;text-decoration:none}}</style>
+</head><body>
+<h2>&#10003; Autenticação Genesys concluída!</h2>
+<p>Salve o <strong>Refresh Token</strong> abaixo como variável <code>GENESYS_REFRESH_TOKEN</code> no Vercel
+(<em>Settings → Environment Variables</em>) para renovação automática:</p>
+<pre id="rt">{refresh_token}</pre>
+<button onclick="navigator.clipboard.writeText(document.getElementById('rt').textContent)">Copiar</button>
+<br><a class="btn" href="/">Ir para o Dashboard</a>
+</body></html>"""
+
         return redirect(url_for("index"))
     except Exception as e:
-        return f"Erro na autenticação: {str(e)}", 500
+        return f"Erro na autenticação OAuth: {str(e)}", 500
 
 @app.route("/debug-auth")
 def debug_auth():
-    """Rota para validar configurações de autenticação em produção."""
-    # Mascara o Client ID para segurança (mostra apenas os primeiros 5 caracteres)
     masked_client_id = f"{GENESYS_CLIENT_ID[:5]}..." if GENESYS_CLIENT_ID else "Não configurado"
-    
     return jsonify({
         "status": "online",
         "region": GENESYS_REGION,
         "redirect_uri": REDIRECT_URI,
         "client_id": masked_client_id,
         "has_client_secret": bool(GENESYS_CLIENT_SECRET),
+        "has_oauth_token": bool(os.getenv("OAUTH_TOKEN")),
+        "has_login_user": bool(os.getenv("LOGIN_USER")),
         "has_refresh_token_disk": os.path.exists(REFRESH_TOKEN_FILE),
-        "vercel_env": bool(os.environ.get("VERCEL"))
+        "vercel_env": bool(os.environ.get("VERCEL")),
     })
 
 # ─── CONFIGURAÇÃO GENESYS & CDR ──────────────────────────────────────────────
@@ -114,32 +124,73 @@ BASE_URL         = f"https://api.{GENESYS_REGION}"
 GENESYS_CLIENT_ID     = os.getenv("GENESYS_CLIENT_ID", "")
 GENESYS_CLIENT_SECRET = os.getenv("GENESYS_CLIENT_SECRET", "")
 
-# Redirecionamento para OAuth
-DEFAULT_REDIRECT = "https://genesys-cdr.vercel.app/callback"
+# Redirecionamento para OAuth — detecta local vs Vercel automaticamente
+_is_vercel = bool(os.environ.get("VERCEL"))
+DEFAULT_REDIRECT = "https://genesys-cdr.vercel.app/callback" if _is_vercel else "http://localhost:5051/callback"
 REDIRECT_URI     = os.getenv("REDIRECT_URI", DEFAULT_REDIRECT)
 REFRESH_TOKEN_FILE = os.path.join(os.path.dirname(__file__), "refresh_token.txt")
 
 # Cache de tokens para evitar renovações excessivas
 _token_cache = {"token": "", "expires_at": 0}
 
+def _kv_get(key):
+    kv_url   = os.environ.get("genesys_KV_REST_API_URL") or os.environ.get("KV_REST_API_URL")
+    kv_token = os.environ.get("genesys_KV_REST_API_TOKEN") or os.environ.get("KV_REST_API_TOKEN")
+    if not kv_url or not kv_token:
+        return None
+    try:
+        r = requests.get(f"{kv_url}/get/{key}",
+                         headers={"Authorization": f"Bearer {kv_token}"}, timeout=5)
+        if r.status_code == 200:
+            return r.json().get("result")
+    except Exception:
+        pass
+    return None
+
+def _kv_set(key, value):
+    kv_url   = os.environ.get("genesys_KV_REST_API_URL") or os.environ.get("KV_REST_API_URL")
+    kv_token = os.environ.get("genesys_KV_REST_API_TOKEN") or os.environ.get("KV_REST_API_TOKEN")
+    if not kv_url or not kv_token:
+        return False
+    try:
+        r = requests.post(f"{kv_url}/set/{key}",
+                          headers={"Authorization": f"Bearer {kv_token}"},
+                          data=value, timeout=5)
+        return r.status_code == 200
+    except Exception:
+        return False
+
 def save_refresh_token(token):
-    """Salva o refresh token na sessão e no disco (se local)."""
-    session['refresh_token'] = token
+    """Salva o refresh token na sessão, no KV (Vercel) e no disco (local)."""
+    try:
+        session['refresh_token'] = token
+    except Exception:
+        pass
+    _kv_set("genesys_refresh_token", token)
     try:
         with open(REFRESH_TOKEN_FILE, "w") as f:
             f.write(token)
     except Exception as e:
-        print(f"Erro ao salvar refresh_token: {e}")
+        print(f"Erro ao salvar refresh_token em disco: {e}")
 
 def load_refresh_token():
-    """Carrega o refresh token da sessão, disco ou ambiente."""
-    if 'refresh_token' in session:
-        return session['refresh_token']
+    """Carrega o refresh token: sessão → KV → disco → env var."""
+    try:
+        if session.get('refresh_token'):
+            return session['refresh_token']
+    except Exception:
+        pass
+    kv_val = _kv_get("genesys_refresh_token")
+    if kv_val:
+        return kv_val
     if os.path.exists(REFRESH_TOKEN_FILE):
         try:
             with open(REFRESH_TOKEN_FILE, "r") as f:
-                return f.read().strip()
-        except: pass
+                val = f.read().strip()
+                if val:
+                    return val
+        except Exception:
+            pass
     return os.getenv("GENESYS_REFRESH_TOKEN")
 
 # Cabeçalhos globais inicializados vazios (serão preenchidos pelo get_token)
@@ -151,54 +202,69 @@ HEADERS = {
 PAGE_SIZE        = 50
 RATE_LIMIT_RPM   = 10
 
+def _exchange_token(grant_type, **extra_data):
+    """Troca credenciais por access_token na Genesys. Retorna (access_token, expires_in, refresh_token)."""
+    import base64
+    auth_url = f"https://login.{GENESYS_REGION}/oauth/token"
+    auth_header = base64.b64encode(f"{GENESYS_CLIENT_ID}:{GENESYS_CLIENT_SECRET}".encode()).decode()
+    data = {"grant_type": grant_type, **extra_data}
+    resp = requests.post(auth_url, data=data,
+                         headers={"Authorization": f"Basic {auth_header}"}, timeout=15)
+    resp.raise_for_status()
+    d = resp.json()
+    return d.get("access_token"), d.get("expires_in", 86400), d.get("refresh_token")
+
+
 def get_auth_token():
-    """Obtém um token de acesso usando Client Credentials de forma automática."""
+    """Obtém token válido na ordem: cache → refresh_token → client_credentials → OAUTH_TOKEN estático."""
     global _token_cache, HEADERS
     now = time.time()
-    
-    # Se o token em cache for válido por mais de 1 minuto, usamos ele
+
+    # 1) Cache ainda válido
     if _token_cache["token"] and _token_cache["expires_at"] > now + 60:
         HEADERS["Authorization"] = _token_cache["token"]
         return _token_cache["token"]
-    
-    # Se não temos credenciais de renovação, tentamos o token estático do .env como fallback
-    if not GENESYS_CLIENT_ID or not GENESYS_CLIENT_SECRET:
-        token = os.getenv("OAUTH_TOKEN") or os.getenv("API_TOKEN", "")
-        if token and not token.startswith("Bearer "):
-            token = f"Bearer {token}"
-        if token:
-            HEADERS["Authorization"] = token
-            return token
-        return None
 
-    try:
-        auth_url = f"https://login.{GENESYS_REGION}/oauth/token"
-        import base64
-        auth_header = base64.b64encode(f"{GENESYS_CLIENT_ID}:{GENESYS_CLIENT_SECRET}".encode()).decode()
-        
-        resp = requests.post(
-            auth_url,
-            data={"grant_type": "client_credentials"},
-            headers={"Authorization": f"Basic {auth_header}"},
-            timeout=15
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        
-        new_token = f"Bearer {data.get('access_token')}"
-        expires_in = data.get("expires_in", 86400)
-        
-        _token_cache = {
-            "token": new_token,
-            "expires_at": now + expires_in
-        }
-        HEADERS["Authorization"] = new_token
-        print(f"Token renovado com sucesso (Client Credentials). Expira em {expires_in}s.")
-        return new_token
-    except Exception as e:
-        print(f"Erro ao obter token automático: {e}")
-        # Tenta usar o cache mesmo expirado se tudo falhar
-        return _token_cache["token"]
+    # 2) Refresh token (Authorization Code flow — renova sem interação do usuário)
+    if GENESYS_CLIENT_ID and GENESYS_CLIENT_SECRET:
+        rt = load_refresh_token()
+        if rt:
+            try:
+                access, expires_in, new_rt = _exchange_token("refresh_token", refresh_token=rt)
+                if access:
+                    new_token = f"Bearer {access}"
+                    _token_cache = {"token": new_token, "expires_at": now + expires_in}
+                    HEADERS["Authorization"] = new_token
+                    if new_rt:
+                        save_refresh_token(new_rt)
+                    print(f"Token renovado via refresh_token. Expira em {expires_in}s.")
+                    return new_token
+            except Exception as e:
+                print(f"Falha ao usar refresh_token: {e}")
+
+    # 3) Client Credentials (se o OAuth client suportar)
+    if GENESYS_CLIENT_ID and GENESYS_CLIENT_SECRET:
+        try:
+            access, expires_in, _ = _exchange_token("client_credentials")
+            if access:
+                new_token = f"Bearer {access}"
+                _token_cache = {"token": new_token, "expires_at": now + expires_in}
+                HEADERS["Authorization"] = new_token
+                print(f"Token renovado via client_credentials. Expira em {expires_in}s.")
+                return new_token
+        except Exception as e:
+            print(f"Falha client_credentials: {e}")
+
+    # 4) OAUTH_TOKEN estático do .env / Vercel env vars
+    static_token = os.getenv("OAUTH_TOKEN") or os.getenv("API_TOKEN", "")
+    if static_token:
+        if not static_token.startswith("Bearer "):
+            static_token = f"Bearer {static_token}"
+        HEADERS["Authorization"] = static_token
+        print("Usando OAUTH_TOKEN estático (pode estar expirado).")
+        return static_token
+
+    return None
 
 
 
